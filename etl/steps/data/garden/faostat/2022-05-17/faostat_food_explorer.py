@@ -12,7 +12,7 @@ from owid.catalog.meta import DatasetMeta
 from owid.datautils import dataframes, geo
 
 from etl.paths import DATA_DIR, STEP_DIR
-from .shared import NAMESPACE, VERSION
+from .shared import NAMESPACE, VERSION, REGIONS_TO_ADD, REGIONS_TO_IGNORE_IN_AGGREGATES
 
 # Dataset name and title.
 DATASET_TITLE = "Food Explorer"
@@ -22,30 +22,11 @@ DATASET_DESCRIPTION = "This dataset has been created by Our World in Data, mergi
                       "FBS) datasets. Each row contains all the metrics for a specific combination of (country, " \
                       "product, year). The metrics may come from different datasets."
 
-# List of columns from combined (qcl + fbsc) dataframe that should have a per capita variable.
-# Note: Some of the columns may already be given as "per capita" variables in the original data.
-# In those cases we will divide by FAO population and multiply by OWID population, for consistency.
-PER_CAPITA_COLUMNS = [
-    'Area harvested (ha)',
-    'Domestic supply (tonnes)',
-    'Exports (tonnes)',
-    'Feed (tonnes)',
-    'Food (tonnes)',
-    'Food available for consumption (grams of fat per day per capita)',
-    'Food available for consumption (grams of protein per day per capita)',
-    'Food available for consumption (kilocalories per day per capita)',
-    'Food available for consumption (kilograms per year per capita)',
-    'Imports (tonnes)',
-    'Other uses (tonnes)',
-    'Producing or slaughtered animals (animals)',
-    'Production (tonnes)',
-    'Waste in Supply Chain (tonnes)',
-]
-
 
 def combine_qcl_and_fbsc(
     qcl_table: catalog.Table, fbsc_table: catalog.Table
 ) -> pd.DataFrame:
+
     columns = ['country', 'year', 'item_code', 'element_code', 'item', 'element', 'unit', 'unit_short_name', 'value',
                'unit_factor', 'population_with_data']
     qcl = pd.DataFrame(qcl_table).reset_index()[columns]
@@ -67,9 +48,8 @@ def combine_qcl_and_fbsc(
     )
 
     # Sanity checks.
-    assert len(combined) == (
-        len(qcl) + len(fbsc)
-    ), "Unexpected number of rows after combining qcl and fbsc datasets."
+    assert len(combined) == (len(qcl) + len(fbsc)), "Unexpected number of rows after combining qcl and fbsc datasets."
+
     assert len(combined[combined["value"].isnull()]) == 0, "Unexpected nan values."
 
     n_items_per_item_code = combined.groupby("item_code")["product"].transform("nunique")
@@ -105,6 +85,89 @@ def get_fao_population(combined: pd.DataFrame) -> pd.DataFrame:
     return fao_population
 
 
+def add_slaughtered_animals_to_meat_total(combined):
+    # There is no FAO data on "Producing or slaughtered animals" for "Meat, Total".
+    # We construct this data by aggregating that element for the following items (which corresponds to all meat
+    # products removing redundances):
+    products_to_aggregate = [
+        'Meat, ass',
+        'Meat, beef and buffalo',
+        'Meat, camel',
+        'Meat, horse',
+        'Meat, lamb and mutton',
+        'Meat, mule',
+        'Meat, pig',
+        'Meat, poultry',
+        'Meat, rabbit',
+        'Meat, sheep and goat',
+    ]
+    error = "Some items required to get the aggregate 'Meat, Total' are missing in data."
+    assert set(products_to_aggregate) < set(combined["product"]), error    
+
+    total_meat_item = "Meat, Total"
+    slaughtered_animals_element = "Producing or slaughtered animals"
+    slaughtered_animals_unit = "animals"
+    slaughtered_animals_unit_short_name = "animals"
+    assert slaughtered_animals_element in combined["element"].unique()
+    assert slaughtered_animals_unit in combined["unit"].unique()    
+
+    # For some reason, there are two element codes for the same element (they have different items assigned).
+    error = "Element codes for 'Producing or slaughtered animals' may have changed."
+    assert combined[(combined["element"] == slaughtered_animals_element) &
+             ~(combined["element_code"].str.contains("pc"))]["element_code"].unique().tolist() == ['005320', '005321'], error
+    # Similarly, there are two items for meat total.
+    error = "Item codes for 'Meat, Total' may have changed."
+    assert combined[combined["product"] == total_meat_item]["item_code"].unique().tolist() == ['00001765', '00002943'], error
+    # We arbitrarily choose the first element code and the first item code.
+    slaughtered_animals_element_code = "005320"
+    total_meat_item_code = "00001765"
+
+    # Check that, indeed, this variable is not given in the original data.
+    assert combined[(combined["product"] == total_meat_item) &
+         (combined["element"]==slaughtered_animals_element) & (combined["unit"] == slaughtered_animals_unit)].empty
+
+    # Select the subset of data to aggregate.
+    data_to_aggregate = combined[(combined["element"] == slaughtered_animals_element) &
+                                 (combined["unit"] == slaughtered_animals_unit) &
+                                 (combined["product"].isin(products_to_aggregate))
+                                ].dropna(subset="value").reset_index(drop=True)
+
+    # Create a dataframe with the total number of animals used for meat.
+    animals = dataframes.groupby_agg(data_to_aggregate, groupby_columns=["country", "year"],
+                           aggregations={"value": "sum"}).reset_index()
+
+    # Manually include the rest of columns.
+    animals["product"] = total_meat_item
+    animals["element"] = slaughtered_animals_element
+    animals["unit"] = slaughtered_animals_unit
+    animals["unit_short_name"] = slaughtered_animals_unit_short_name
+    animals["element_code"] = slaughtered_animals_element_code
+    animals["item_code"] = total_meat_item_code
+
+    # Add animals data to the original dataframe.
+    combined_data = pd.concat([combined, animals], ignore_index=True).reset_index(drop=True)
+
+    return combined_data
+
+
+def add_slaughtered_animals_per_capita_to_meat_total(data_wide):
+    slaughtered_animals_element = "Producing or slaughtered animals (animals)"
+    slaughtered_animals_per_capita_element = "Producing or slaughtered animals (animals per capita)"
+    total_meat_item = "Meat, Total"
+
+    # Check that there is no data for slaughtered animals per capita in the total meat item.
+    assert data_wide[data_wide["product"] == total_meat_item][slaughtered_animals_per_capita_element].dropna().empty
+
+    # Add per capita slaugthred animals.
+
+    total_meat_item_mask = data_wide["product"] == total_meat_item
+
+    data_wide.loc[total_meat_item_mask, slaughtered_animals_per_capita_element] =\
+        data_wide[total_meat_item_mask][slaughtered_animals_element] / data_wide[total_meat_item_mask]["population"]
+
+    return data_wide
+
+
 def process_combined_data(combined: pd.DataFrame, custom_products: pd.DataFrame) -> pd.DataFrame:
     combined = combined.copy()
 
@@ -119,6 +182,15 @@ def process_combined_data(combined: pd.DataFrame, custom_products: pd.DataFrame)
     combined["product"] = dataframes.map_series(combined["product"], mapping=products_renaming,
                                                 warn_on_unused_mappings=True)
 
+    # For the food explorer we have to multiply data by the unit factor, since these conversions
+    # will not be applied in grapher.
+    rows_to_convert_mask = combined["unit_factor"].notnull()
+    combined.loc[rows_to_convert_mask, "value"] = combined[rows_to_convert_mask]["value"] * \
+        combined[rows_to_convert_mask]["unit_factor"]
+
+    # Include number of slaughtered animals in 'Meat, Total' (which is missing).
+    combined = add_slaughtered_animals_to_meat_total(combined)
+
     # Get list of products that will be used in food explorer.
     products = sorted(custom_products["product_in_explorer"].fillna(custom_products["product_in_data"]).
                       unique().tolist())
@@ -129,13 +201,7 @@ def process_combined_data(combined: pd.DataFrame, custom_products: pd.DataFrame)
 
     # Select relevant products for the food explorer.
     combined = combined[combined["product"].isin(products)].reset_index(drop=True)
-
-    # For the food explorer we have to multiply data by the unit factor, since these conversions
-    # will not be applied in grapher.
-    rows_to_convert_mask = combined["unit_factor"].notnull()
-    combined.loc[rows_to_convert_mask, "value"] = combined[rows_to_convert_mask]["value"] * \
-        combined[rows_to_convert_mask]["unit_factor"]
-
+    
     # Join element and unit into one title column.
     combined["title"] = combined["element"] + " (" + combined["unit"] + ")"
 
@@ -150,27 +216,17 @@ def process_combined_data(combined: pd.DataFrame, custom_products: pd.DataFrame)
 
     # Add column for OWID population.
     data_wide = geo.add_population_to_dataframe(df=data_wide, warn_on_missing_countries=False)
-    # Add population of countries for which we have data.
-    population_with_data = combined.pivot(index=index_columns, columns=["title"],
-                                          values="population_with_data").reset_index()
 
-    # TODO: Check that population and population with data are exactly the same for non-regions.
-    # TODO: Warn on regions where population with data is much smaller than total population.
+    # Fill gaps in OWID population with FAO population (for "* (FAO)" countries, i.e. countries that were not
+    # harmonized and for which there is no OWID population).
+    # Then drop "fao_population", since it is no longer needed.
+    data_wide["population"] = data_wide["population"].fillna(data_wide["fao_population"])
+    data_wide = data_wide.drop(columns="fao_population")
 
-    # Add per capita variables.
-    for column in PER_CAPITA_COLUMNS:
-        if "per capita" in column.lower():
-            # Some variables are already given per capita in the FAOSTAT dataset.
-            # But, since their population may differ with ours, for consistency, we multiply their per capita variables
-            # by their population, to obtain the total variable, and then we divide by our own population.
-            data_wide[column] = data_wide[column] * data_wide["fao_population"] / population_with_data[column]
-        else:
-            # Create a new column with the same name, but adding "per capita" to the unit.
-            data_wide[column[:-1] + " per capita)"] = data_wide[column] / population_with_data[column]
+    # Add per capita number of slaughtered animals for total meat.
+    data_wide = add_slaughtered_animals_per_capita_to_meat_total(data_wide)
 
-    assert (
-        len(data_wide.columns[data_wide.isnull().all(axis=0)]) == 0
-    ), "Unexpected columns with only nan values."
+    assert len(data_wide.columns[data_wide.isnull().all(axis=0)]) == 0, "Unexpected columns with only nan values."
 
     # Set a reasonable index.
     data_wide = data_wide.set_index(index_columns, verify_integrity=True)
@@ -209,8 +265,9 @@ def run(dest_dir: str) -> None:
     # Process data.
     ####################################################################################################################
 
-    combined = combine_qcl_and_fbsc(qcl_table=qcl_table, fbsc_table=fbsc_table)
-    data = process_combined_data(combined=combined, custom_products=custom_products)
+    data = combine_qcl_and_fbsc(qcl_table=qcl_table, fbsc_table=fbsc_table)
+
+    data = process_combined_data(combined=data, custom_products=custom_products)
 
     ####################################################################################################################
     # Save outputs.
