@@ -34,16 +34,18 @@ mapping in the data is the correct one (except possibly in the examples mentione
 
 """
 
+import json
+import sys
 from copy import deepcopy
 from typing import List
 
 import pandas as pd
 from owid import catalog
-from owid.datautils import dataframes
+from owid.datautils import dataframes, io
 from tqdm.auto import tqdm
 
 from etl.paths import DATA_DIR, STEP_DIR
-from .shared import FLAGS_RANKING, harmonize_elements, harmonize_items, VERSION, optimize_table_dtypes
+from .shared import FLAGS_RANKING, harmonize_elements, harmonize_items, VERSION, optimize_table_dtypes, log
 
 # Define namespace and short name for output dataset.
 NAMESPACE = "faostat"
@@ -98,10 +100,10 @@ def clean_global_dataset_descriptions_dataframe(datasets_df: pd.DataFrame,
     changed_descriptions = datasets_df[datasets_df["fao_dataset_description_old"] !=
                                        datasets_df["fao_dataset_description_new"]]
     if len(changed_titles) > 0:
-        print(f"WARNING: {len(changed_titles)} domains have changed titles, consider updating custom_datasets.csv.")
+        log.warning(f"{len(changed_titles)} domains have changed titles, consider updating custom_datasets.csv.")
     if len(changed_descriptions) > 0:
-        print(f"WARNING: {len(changed_descriptions)} domains have changed descriptions. "
-              f"Consider updating custom_datasets.csv.")
+        log.warning(f"{len(changed_descriptions)} domains have changed descriptions. "
+                    f"Consider updating custom_datasets.csv.")
 
     datasets_df = datasets_df.drop(columns=["fao_dataset_title_old", "fao_dataset_description_old"]).rename(columns={
         "fao_dataset_title_new": "fao_dataset_title", "fao_dataset_description_new": "fao_dataset_description"})
@@ -163,8 +165,8 @@ def create_items_dataframe_for_domain(table: catalog.Table, metadata: catalog.Da
     different_items = compared[compared["fao_item_in_data"] != compared["fao_item_in_metadata"]]
     missing_item_codes = set(items_from_data["item_code"]) - set(_items_df["item_code"])
     if (len(different_items) + len(missing_item_codes)) > N_ISSUES_ON_ITEMS_FOR_WARNING:
-        print(f"WARNING: {len(missing_item_codes)} item codes in {dataset_short_name} missing in metadata. "
-              f"{len(different_items)} item codes in data mapping to different items in metadata.")
+        log.warning(f"{len(missing_item_codes)} item codes in {dataset_short_name} missing in metadata. "
+                    f"{len(different_items)} item codes in data mapping to different items in metadata.")
 
     return items_from_data
 
@@ -188,8 +190,8 @@ def clean_global_items_dataframe(items_df: pd.DataFrame, custom_items: pd.DataFr
     changed_descriptions = items_df[(items_df["fao_item_description_old"] != items_df["fao_item_description_new"]) &
                                     (items_df["fao_item_description_old"].notnull())]
     if len(changed_descriptions) > 0:
-        print(f"WARNING: {len(changed_descriptions)} domains have changed descriptions. "
-              f"Consider updating custom_items.csv.")
+        log.warning(f"WARNING: {len(changed_descriptions)} domains have changed descriptions. "
+                    f"Consider updating custom_items.csv.")
 
     items_df = items_df.drop(columns="fao_item_description_old").rename(
         columns={"fao_item_description_new": "fao_item_description"})
@@ -292,14 +294,14 @@ def clean_global_elements_dataframe(elements_df: pd.DataFrame, custom_elements: 
     changed_units = elements_df[(elements_df["fao_unit_new"] != elements_df["fao_unit_old"]) &
                                 (elements_df["fao_unit_old"].notnull())]
     if len(changed_units) > 0:
-        print(f"WARNING: {len(changed_units)} domains have changed units, consider updating custom_elements.csv.")
+        log.warning(f"{len(changed_units)} domains have changed units, consider updating custom_elements.csv.")
 
     changed_descriptions = elements_df[(elements_df["fao_element_description_new"] !=
                                         elements_df["fao_element_description_old"]) &
                                        (elements_df["fao_element_description_old"].notnull())]
     if len(changed_descriptions) > 0:
-        print(f"WARNING: {len(changed_descriptions)} domains have changed descriptions. "
-              f"Consider updating custom_elements.csv.")
+        log.warning(f"{len(changed_descriptions)} domains have changed descriptions. "
+                    f"Consider updating custom_elements.csv.")
 
     elements_df = elements_df.drop(columns=["fao_unit_old", "fao_element_description_old"]).rename(
         columns={"fao_element_description_new": "fao_element_description", "fao_unit_new": "fao_unit"})
@@ -344,6 +346,34 @@ def clean_global_elements_dataframe(elements_df: pd.DataFrame, custom_elements: 
     # multiple element codes with the same element. And idem for items.
 
     return elements_df
+
+
+def clean_global_countries_dataframe(countries_in_data, country_groups, countries_harmonization):
+    countries_df = countries_in_data.copy()
+    countries_not_harmonized = sorted(set(countries_df["fao_country"]) - set(countries_harmonization))
+    if len(countries_not_harmonized) > 0:
+        log.info(f"{len(countries_not_harmonized)} countries not included in countries file. "
+                 f"They will not have data after countries are harmonized in a further step.")
+
+    # Harmonize country groups and members.
+    country_groups_harmonized = {
+        countries_harmonization[group]: sorted([countries_harmonization[member] for member in country_groups[group]])
+        for group in country_groups if group in countries_harmonization}
+
+    # Harmonize country names.
+    countries_df["country"] = dataframes.map_series(
+        series=countries_df["fao_country"], mapping=countries_harmonization, warn_on_unused_mappings=True,
+        make_unmapped_values_nan=True, show_full_warning=False)
+
+    # Add country members to countries dataframe.
+    countries_df["members"] = dataframes.map_series(
+        series=countries_df["country"], mapping=country_groups_harmonized, make_unmapped_values_nan=True)
+
+    # Feather does not support object types, so convert column of lists to column of strings.
+    countries_df["members"] = [json.dumps(members) if isinstance(members, list) else members
+                               for members in countries_df["members"]]
+
+    return countries_df
 
 
 def create_table(df: pd.DataFrame, short_name: str, index_cols: List[str]) -> catalog.Table:
@@ -403,18 +433,17 @@ def check_that_all_flags_in_dataset_are_in_ranking(
         missing_flags = set(table["flag"]) - set(FLAGS_RANKING["flag"])
         flags_data = pd.DataFrame(metadata_for_flags).reset_index()
         if set(missing_flags) < set(flags_data["flag"]):
-            print(
-                "Manually copy the following lines to FLAGS_RANKING (and put them in the right order):"
-            )
+            message = "Missing flags. Copy the following lines to FLAGS_RANKING (and put them in the right order):"
             for i, j in (
                 pd.DataFrame(metadata_for_flags)
                 .loc[list(missing_flags)]
                 .iterrows()
             ):
-                print(f"{(i, j['flags'])},")
+                message += f"\n{(i, j['flags'])},"
+            log.warning(message)
         else:
-            print(
-                f"Not all flags ({missing_flags}) are defined in additional metadata. Get their definition from "
+            log.warning(
+                f"Missing flags. {missing_flags} are not defined in additional metadata. Get definition from "
                 f"https://www.fao.org/faostat/en/#definitions"
             )
         raise AssertionError(
@@ -440,6 +469,9 @@ def run(dest_dir: str) -> None:
     metadata_version = sorted((DATA_DIR / "meadow" / NAMESPACE).glob(f"*/{DATASET_SHORT_NAME}"))[-1].parent.name
     metadata_path = DATA_DIR / "meadow" / NAMESPACE / metadata_version / DATASET_SHORT_NAME
 
+    # Countries file, with mapping from FAO names to OWID harmonized country names.
+    countries_file = garden_code_dir / f"{NAMESPACE}.countries.json"
+
     ####################################################################################################################
     # Load and process data.
     ####################################################################################################################
@@ -456,6 +488,9 @@ def run(dest_dir: str) -> None:
     custom_elements = pd.read_csv(custom_elements_and_units_file, dtype=str)
     custom_items = pd.read_csv(custom_items_file, dtype=str)
 
+    # Load countries file.
+    countries_harmonization = io.local.load_json(countries_file)
+
     # List all FAOSTAT dataset short names.
     dataset_short_names = sorted(set([NAMESPACE + "_" + table_name.split("_")[1]
                                       for table_name in metadata.table_names]))
@@ -468,10 +503,25 @@ def run(dest_dir: str) -> None:
     elements_df = pd.DataFrame({"dataset": [], "element_code": [], "fao_element": [], "fao_element_description": [],
                                 "fao_unit": [], "fao_unit_short_name": []})
 
+    # Initialise list of all countries in all datasets, and all country groups.
+    countries_in_data = pd.DataFrame({"area_code": [], "fao_country": []}).astype({"area_code": "Int64"})
+    country_groups_in_data = {}
     # Gather all variables from the latest version of each meadow dataset.
-    for dataset_short_name in tqdm(dataset_short_names):
+    for dataset_short_name in tqdm(dataset_short_names, file=sys.stdout):
         # Load latest meadow table for current dataset.
         table = load_latest_data_table_for_dataset(dataset_short_name=dataset_short_name)
+        df = pd.DataFrame(table.reset_index()).rename(
+            columns={"area": "fao_country", "recipient_country": "fao_country",
+                     "recipient_country_code": "area_code"})
+
+        # Column 'area_code' in faostat_sdgb is float instead of integer, and it does not seem to agree
+        # with the usual area codes. For example, Afghanistan has area code 4.0 in faostat_sdgb, whereas
+        # in other dataset it is 2. Also, there are area codes in faostat_sdgb with many decimals, like area
+        # "FAO Major Fishing Area: Atlantic, Eastern Central (14.4.1)", which has area code 920.710022.
+        # Therefore, we make these area codes nans if they are not integers.
+        if df["area_code"].dtype == "float64":
+            df["area_code"] = pd.NA
+        df["area_code"] = df["area_code"].astype("Int64")
 
         check_that_all_flags_in_dataset_are_in_ranking(
             table=table, metadata_for_flags=metadata[f"{dataset_short_name}_flag"])
@@ -486,6 +536,27 @@ def run(dest_dir: str) -> None:
         elements_from_data = create_elements_dataframe_for_domain(
             table=table, metadata=metadata, dataset_short_name=dataset_short_name)
 
+        # Add countries in this dataset to the list of all countries.
+        countries_in_data = pd.concat([countries_in_data, df[["area_code", "fao_country"]]]).drop_duplicates()
+
+        # Get country groups in this dataset.
+        area_group_table_name = f"{dataset_short_name}_area_group"
+        country_groups = {}
+        if area_group_table_name in metadata:
+            country_groups = metadata[f"{dataset_short_name}_area_group"].reset_index().\
+                drop_duplicates(subset=["country_group", "country"]).groupby("country_group").agg({"country": list}).\
+                to_dict()["country"]
+            # Add new groups to country_groups_in_data; if they are already there, ensure they contain all members.
+            for group in list(country_groups):
+                if group not in countries_in_data["fao_country"]:
+                    # This should not happen, but skip just in case.
+                    continue
+                if group in list(country_groups_in_data):
+                    all_members = set(country_groups_in_data[group]) | set(country_groups[group])
+                    country_groups_in_data[group] = all_members
+                else:
+                    country_groups_in_data[group] = country_groups[group]
+
         # Add dataset descriptions, items, and element-units from current dataset to global dataframes.
         datasets_df = dataframes.concatenate([datasets_df, datasets_from_data], ignore_index=True)
         items_df = dataframes.concatenate([items_df, items_from_data], ignore_index=True)
@@ -495,7 +566,11 @@ def run(dest_dir: str) -> None:
         datasets_df=datasets_df, custom_datasets=custom_datasets)
     items_df = clean_global_items_dataframe(items_df=items_df, custom_items=custom_items)
     elements_df = clean_global_elements_dataframe(
-        elements_df=elements_df, custom_elements=custom_elements)
+        elements_df=elements_df, custom_elements=custom_elements)    
+
+    countries_df = clean_global_countries_dataframe(
+        countries_in_data=countries_in_data, country_groups=country_groups,
+        countries_harmonization=countries_harmonization)
 
     ####################################################################################################################
     # Save outputs.
@@ -509,12 +584,14 @@ def run(dest_dir: str) -> None:
     # Create new dataset in garden.
     dataset_garden.save()
 
-    # Create new garden dataset with all dataset descriptions, items, and element-units.
+    # Create new garden dataset with all dataset descriptions, items, element-units, and countries.
     datasets_table = create_table(df=datasets_df, short_name="datasets", index_cols=["dataset"])
     items_table = create_table(df=items_df, short_name="items", index_cols=["item_code"])
     elements_table = create_table(df=elements_df, short_name="elements", index_cols=["element_code"])
+    countries_table = create_table(df=countries_df, short_name="countries", index_cols=["area_code"])
 
     # Add tables to dataset (no need to repack, since columns already have optimal dtypes).
     dataset_garden.add(datasets_table, repack=False)
     dataset_garden.add(items_table, repack=False)
     dataset_garden.add(elements_table, repack=False)
+    dataset_garden.add(countries_table, repack=False)
