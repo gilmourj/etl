@@ -242,6 +242,9 @@ HISTORIC_TO_CURRENT_REGION = {
     },
 }
 
+# Additional text to include in the metadata title of the output wide table.
+ADDED_TITLE_TO_WIDE_TABLE = " - Flattened table indexed by country-year."
+
 # Flag to assign to data points with nan flag (which by definition is considered official data).
 FLAG_OFFICIAL_DATA = "official_data"
 # Flag to assign to data points for regions that are the result of aggregating data points with different flags.
@@ -324,7 +327,7 @@ def check_that_regions_with_subregions_are_ignored_when_constructing_aggregates(
         (~countries_metadata["country"].isin(REGIONS_TO_ADD)) &
         (~countries_metadata["country"].isin(REGIONS_TO_IGNORE_IN_AGGREGATES)) &
         (~countries_metadata["country"].str.contains("(FAO)", regex=False).fillna(False)) &
-        (countries_metadata["members"].notnull())]["country"].unique().tolist()    
+        (countries_metadata["members"].notnull())]["country"].unique().tolist()
 
     error = f"Regions {countries_with_subregions} contain subregions. Add them to REGIONS_TO_IGNORE_IN_AGGREGATES to " \
             f"avoid double-counting subregions when constructing aggregates."
@@ -742,7 +745,7 @@ def add_regions(data, elements_metadata):
                 # Select relevant rows in the data.
                 data_region = data[(data["country"].isin(countries_in_region)) &
                                    (data["element_code"].isin(element_codes))]
-                
+
                 # Ensure there is no overlap between historical regions and their successors.
                 data_region = remove_overlapping_data_between_historical_regions_and_successors(data_region)
 
@@ -891,10 +894,13 @@ def convert_variables_given_per_capita_to_total_value(data, elements_metadata):
         log.info(f"{len(elements_converted)} elements converted from per-capita to total values: {elements_converted}")
 
         # Include an additional description to all elements that were converted from per capita to total variables.
-        data["element_description"] = pd.Series([description for description in data["element_description"]])
-        data.loc[per_capita_mask, "element_description"] = (data[per_capita_mask]["element_description"].fillna("") +
-                                                            " " + WAS_PER_CAPITA_ADDED_ELEMENT_DESCRIPTION).str.lstrip()
-        data["element_description"] = data["element_description"].astype("category")
+        if "" not in data["element_description"].cat.categories:
+            data["element_description"] = data["element_description"].cat.add_categories([""])
+        data.loc[per_capita_mask, "element_description"] = data.loc[per_capita_mask, "element_description"].fillna('')
+        data["element_description"] = dataframes.apply_on_categoricals(
+            [data.element_description, per_capita_mask.astype("category")],
+            lambda desc, mask: f"{desc} {WAS_PER_CAPITA_ADDED_ELEMENT_DESCRIPTION}".lstrip() if mask else f"{desc}",
+        )
 
     return data
 
@@ -1169,10 +1175,8 @@ def run(dest_dir: str) -> None:
     # Common definitions.
     ####################################################################################################################
 
-    # Assume dest_dir is a path to the step that needs to be run, e.g. "faostat_qcl", and fetch namespace and dataset
-    # short name from that path.
+    # Assume dest_dir is a path to the step to be run, e.g. "faostat_qcl", and get the dataset short name from it.
     dataset_short_name = Path(dest_dir).name
-    # namespace = dataset_short_name.split("_")[0]
     # Path to latest dataset in meadow for current FAOSTAT domain.
     meadow_data_dir = sorted((DATA_DIR / "meadow" / NAMESPACE).glob(f"*/{dataset_short_name}"))[-1].parent /\
         dataset_short_name
@@ -1256,7 +1260,7 @@ def run(dest_dir: str) -> None:
     # Add wide table to the dataset.
     data_table_wide.metadata = deepcopy(data_table_long.metadata)
 
-    data_table_wide.metadata.title += " - Flattened table indexed by country-year."
+    data_table_wide.metadata.title += ADDED_TITLE_TO_WIDE_TABLE
     data_table_wide.metadata.short_name += "_flat"
     data_table_wide.metadata.primary_key = list(data_table_wide.index.names)
 
