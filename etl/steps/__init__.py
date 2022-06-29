@@ -36,6 +36,7 @@ with warnings.catch_warnings():
 
 from owid import catalog
 from owid import walden
+from owid.walden import CATALOG as WALDEN_CATALOG
 
 from etl import files, paths, git
 from etl.helpers import get_etag
@@ -53,7 +54,11 @@ DAG = Dict[str, Any]
 
 
 def compile_steps(
-    dag: DAG, includes: Optional[List[str]] = None, excludes: Optional[List[str]] = None
+    dag: DAG,
+    includes: Optional[List[str]] = None,
+    excludes: Optional[List[str]] = None,
+    downstream: bool = False,
+    only: bool = False,
 ) -> List["Step"]:
     """
     Return the list of steps which, if executed in order, mean that every
@@ -63,21 +68,31 @@ def compile_steps(
     excludes = excludes or []
 
     # make sure each step runs after its dependencies
-    steps = to_dependency_order(dag, includes, excludes)
+    steps = to_dependency_order(
+        dag, includes, excludes, downstream=downstream, only=only
+    )
 
     # parse the steps into Python objects
     return [parse_step(name, dag) for name in steps]
 
 
 def to_dependency_order(
-    dag: DAG, includes: List[str], excludes: List[str]
+    dag: DAG,
+    includes: List[str],
+    excludes: List[str],
+    downstream: bool = False,
+    only: bool = False,
 ) -> List[str]:
     """
     Organize the steps in dependency order with a topological sort. In other words,
     the resulting list of steps is a valid ordering of steps such that no step is run
     before the steps it depends on. Note: this ordering is not necessarily unique.
     """
-    subgraph = filter_to_subgraph(dag, includes) if includes else dag
+    subgraph = (
+        filter_to_subgraph(dag, includes, downstream=downstream, only=only)
+        if includes
+        else dag
+    )
     in_order = list(graphlib.TopologicalSorter(subgraph).static_order())
 
     # filter out explicit excludes
@@ -89,13 +104,13 @@ def to_dependency_order(
 
 
 def filter_to_subgraph(
-    graph: Graph, includes: Iterable[str], incl_forward: bool = True
+    graph: Graph, includes: Iterable[str], downstream: bool = False, only: bool = False
 ) -> Graph:
     """
     Filter the full graph to only the included nodes, and all their dependencies.
 
-    If the incl_forward flag is true, also include "forward dependencies" (dependents),
-    and their own (backward) dependencies.
+    If the downstream flag is true, also include downstream dependencies (ie steps
+    that depend on the included steps), as well as their OWN dependencies.
 
     Assumes that the graph is organized dependent -> dependency (A -> B means A is
     dependent on B).
@@ -105,7 +120,11 @@ def filter_to_subgraph(
         s for s in all_steps if any(re.findall(pattern, s) for pattern in includes)
     }
 
-    if incl_forward:
+    if only:
+        # Do not search for dependencies, only include explicitly selected nodes
+        return {step: set() for step in included}
+
+    if downstream:
         # Reverse the graph to find all nodes dependent on included nodes (forward deps)
         forward_deps = set(traverse(reverse_graph(graph), included))
         included = included.union(forward_deps)
@@ -407,9 +426,6 @@ class ReferenceStep(DataStep):
 @dataclass
 class WaldenStep(Step):
     path: str
-    # NOTE: reusing catalog between steps improves performance a lot
-    #   call `refresh` to refresh cache and get the latest version
-    _walden_catalog = walden.Catalog()
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -448,13 +464,14 @@ class WaldenStep(Step):
             raise ValueError(f"malformed walden path: {self.path}")
 
         namespace, version, short_name = self.path.split("/")
-        catalog = self._walden_catalog
 
         # normally version is a year or date, but we also accept "latest"
         if version == "latest":
-            dataset = catalog.find_latest(namespace=namespace, short_name=short_name)
+            dataset = WALDEN_CATALOG.find_latest(
+                namespace=namespace, short_name=short_name
+            )
         else:
-            dataset = catalog.find_one(
+            dataset = WALDEN_CATALOG.find_one(
                 namespace=namespace, version=version, short_name=short_name
             )
 

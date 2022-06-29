@@ -10,7 +10,7 @@ NOTES:
   (namely flag "R", found in qcl dataset, and "W" in rt dataset). These flags were added manually, using the definition
   in List / Flags in:
   https://www.fao.org/faostat/en/#definitions
-* Other flags (namel "B", in rl dataset and "w" in rt dataset) were not found either in the additional metadata or in
+* Other flags (namely "B", in rl dataset and "w" in rt dataset) were not found either in the additional metadata or in
   the website definitions. They have been assigned the description "Unknown flag".
 * Unfortunately, flags do not remove all ambiguities: remaining duplicates are dropped without any meaningful criterion.
 
@@ -83,7 +83,7 @@ ITEM_AMENDMENTS = {
 # For example, if for a certain variable in a certain year, only a few countries with little population have data,
 # then assign nan to that region-variable-year.
 # Define here that minimum fraction of population that must have data to create an aggregate.
-MIN_FRAC_POPULATION_WITH_DATA = 0.7
+MIN_FRAC_POPULATION_WITH_DATA = 0.
 # Reference year to build the list of mandatory countries.
 REFERENCE_YEAR = 2018
 REGIONS_TO_ADD = {
@@ -140,23 +140,107 @@ WAS_PER_CAPITA_ADDED_ELEMENT_DESCRIPTION = "Originally given per-capita, and con
 NEW_PER_CAPITA_ADDED_ELEMENT_DESCRIPTION = "Per-capita values are obtained by dividing the original values by the " \
                                            "population (either provided by FAO or by OWID)."
 
-# When creating region aggregates, we need to ignore regions that are historical (i.e. they do not exist today as
-# countries) or are geographical regions (instead of countries). We ignore them to avoid the risk of counting the
-# contribution of certain countries twice.
+# When creating region aggregates, we need to ignore geographical regions that contain aggregate data from other
+# countries, to avoid double-counting the data of those countries.
+# Note: This list does not contain all country groups, but only those that are in our list of harmonized countries
+# (without the *(FAO) suffix).
 REGIONS_TO_IGNORE_IN_AGGREGATES = [
-    'Czechoslovakia',  # Historic
-    'Eritrea and Ethiopia',  # Historic
-    'French Southern Territories',  # Region
-    'Melanesia',  # Region
-    'Netherlands Antilles',  # Historic
-    'Polynesia',  # Region
-    'Serbia and Montenegro',  # Historic
-    'Svalbard and Jan Mayen',  # Region
-    'Timor',  # Region
-    'USSR',  # Historic
-    'United States Minor Outlying Islands',  # Region
-    'Yugoslavia',  # Historic
+    'Melanesia',
+    'Polynesia',
 ]
+
+# When creating region aggregates, decide how to distribute historical regions.
+# The following decisions are based on the current location of the countries that succeeded the region, and their income
+# group. Continent and income group assigned corresponds to the continent and income group of the majority of the
+# population in the member countries.
+HISTORIC_TO_CURRENT_REGION = {
+    "Czechoslovakia": {
+        "continent": "Europe",
+        "income_group": "High-income countries",
+        "members": [
+            # Europe - High-income countries.
+            "Czechia",
+            "Slovakia",
+        ],
+    },
+    "Eritrea and Ethiopia": {
+        "continent": "Africa",
+        "income_group": "Low-income countries",
+        "members": [
+            # Africa - Low-income countries.
+            "Ethiopia",
+            "Eritrea",
+        ],
+    },
+    "Netherlands Antilles": {
+        "continent": "North America",
+        "income_group": "High-income countries",
+        "members": [
+            # North America - High-income countries.
+            "Aruba",
+            "Curacao",
+            "Sint Maarten (Dutch part)",
+        ],
+    },
+    "Serbia and Montenegro": {
+        "continent": "Europe",
+        "income_group": "Upper-middle-income countries",
+        "members": [
+            # Europe - Upper-middle-income countries.
+            "Serbia",
+            "Montenegro",
+        ],
+    },
+    "Sudan (former)": {
+        "continent": "Africa",
+        "income_group": "Low-income countries",
+        "members": [
+            # Africa - Low-income countries.
+            "Sudan",
+            "South Sudan",
+        ],
+    },
+    "USSR": {
+        "continent": "Europe",
+        "income_group": "Upper-middle-income countries",
+        "members": [
+            # Europe - High-income countries.
+            "Lithuania",
+            "Estonia",
+            "Latvia",
+            # Europe - Upper-middle-income countries.
+            "Moldova",
+            "Belarus",
+            "Russia",
+            # Europe - Lower-middle-income countries.
+            "Ukraine",
+            # Asia - Upper-middle-income countries.
+            "Georgia",
+            "Armenia",
+            "Azerbaijan",
+            "Turkmenistan",
+            "Kazakhstan",
+            # Asia - Lower-middle-income countries.
+            "Kyrgyzstan",
+            "Uzbekistan",
+            "Tajikistan",
+        ],
+    },
+    "Yugoslavia": {
+        "continent": "Europe",
+        "income_group": "Upper-middle-income countries",
+        "members": [
+            # Europe - High-income countries.
+            "Croatia",
+            "Slovenia",
+            # Europe - Upper-middle-income countries.
+            "North Macedonia",
+            "Bosnia and Herzegovina",
+            "Serbia",
+            "Montenegro",
+        ],
+    },
+}
 
 # Flag to assign to data points with nan flag (which by definition is considered official data).
 FLAG_OFFICIAL_DATA = "official_data"
@@ -529,11 +613,25 @@ def remove_regions_from_countries_regions_members(countries_regions, regions_to_
 
 
 def _load_population() -> pd.DataFrame:
-    population = (
-        catalog.find("population", namespace="owid", dataset="key_indicators")
-        .load()
-        .reset_index()
-    )
+    # Load population dataset.
+    population = catalog.find("population", namespace="owid", dataset="key_indicators").load().\
+        reset_index()[["country", "year", "population"]]
+
+    # Add data for historical regions (if not in population) by adding the population of its current successors.
+    countries_with_population = population["country"].unique()
+    missing_countries = [country for country in HISTORIC_TO_CURRENT_REGION
+                         if country not in countries_with_population]
+    for country in missing_countries:
+        members = HISTORIC_TO_CURRENT_REGION[country]["members"]
+        _population = population[population["country"].isin(members)].\
+            groupby("year").agg({"population": "sum", "country": "nunique"}).reset_index()
+        # Select only years for which we have data for all member countries.
+        _population = _population[_population["country"] == len(members)].reset_index(drop=True)
+        _population["country"] = country
+        population = pd.concat([population, _population], ignore_index=True).reset_index(drop=True)
+
+    error = "Duplicate country-years found in population. Check if historical regions changed."
+    assert population[population.duplicated(subset=["country", "year"])].empty, error
 
     return cast(pd.DataFrame, population)
 
@@ -548,7 +646,21 @@ def _load_countries_regions() -> pd.DataFrame:
     return cast(pd.DataFrame, countries_regions)
 
 
-def _list_countries_in_region(region, countries_regions):
+def _load_income_groups() -> pd.DataFrame:
+    income_groups = catalog.find(table="wb_income_group", dataset="wb_income", namespace="wb", channels=["garden"]).\
+        load().reset_index()
+    # Add historical regions to income groups.
+    for historic_region in HISTORIC_TO_CURRENT_REGION:
+        historic_region_income_group = HISTORIC_TO_CURRENT_REGION[historic_region]["income_group"]
+        if historic_region not in income_groups["country"]:
+            historic_region_df = pd.DataFrame({"country": [historic_region],
+                                               "income_group": [historic_region_income_group]})
+            income_groups = pd.concat([income_groups, historic_region_df], ignore_index=True)
+
+    return income_groups
+
+
+def _list_countries_in_region(region, countries_regions, income_groups):
     # Number of attempts to fetch countries regions data.
     attempts = 5
     attempt = 0
@@ -556,7 +668,8 @@ def _list_countries_in_region(region, countries_regions):
     while attempt < attempts:
         try:
             # List countries in region.
-            countries_in_region = geo.list_countries_in_region(region=region, countries_regions=countries_regions)
+            countries_in_region = geo.list_countries_in_region(region=region, countries_regions=countries_regions,
+                                                               income_groups=income_groups)
             break
         except ConnectionResetError:
             attempt += 1
@@ -564,6 +677,36 @@ def _list_countries_in_region(region, countries_regions):
             assert countries_in_region is not None, "Unable to fetch countries-regions data."
 
     return countries_in_region
+
+
+def remove_overlapping_data_between_historical_regions_and_successors(data_region):
+    data_region = data_region.copy()
+    # Sometimes, data for historical regions (e.g. USSR) overlaps with data of the successor countries (e.g. Russia).
+    # Ideally, we would keep only data for the newer countries. However, if not all successors have data, we would be
+    # having an incomplete aggregation, and therefore it would be better to keep data from the historical region.
+    columns = ["item_code", "element_code", "year"]
+
+    indexes_to_drop = []
+    for historical_region in HISTORIC_TO_CURRENT_REGION:
+        historical_successors = HISTORIC_TO_CURRENT_REGION[historical_region]["members"]
+        historical_region_years = data_region[(data_region["country"] == historical_region)][columns].\
+            drop_duplicates()
+        historical_successors_years = data_region[(data_region["country"].isin(historical_successors))][columns].\
+            drop_duplicates()
+        overlapping_years = pd.concat([historical_region_years, historical_successors_years], ignore_index=True)
+        overlapping_years = overlapping_years[overlapping_years.duplicated()]
+        if not overlapping_years.empty:
+            log.warning(f"Removing rows where historical region {historical_region} overlaps with its successors "
+                        f"(years {sorted(set(overlapping_years['year']))}).")
+            # Select rows in data_region to drop.
+            overlapping_years["country"] = historical_region
+            indexes_to_drop.extend(pd.merge(data_region.reset_index(), overlapping_years, how='inner',
+                                            on=["country"] + columns)["index"].tolist())
+
+    if len(indexes_to_drop) > 0:
+        data_region = data_region.drop(index=indexes_to_drop)
+
+    return data_region
 
 
 def add_regions(data, elements_metadata):
@@ -574,19 +717,20 @@ def add_regions(data, elements_metadata):
     aggregations = elements_metadata[(elements_metadata["owid_aggregation"].notnull())].\
         set_index("element_code").to_dict()["owid_aggregation"]
     if len(aggregations) > 0:
-        log.info("clean_data.add_regions", shape=data.shape)
+        log.info("add_regions", shape=data.shape)
 
-        # Load population dataset and countries-regions dataset.
+        # Load population dataset, countries-regions, and income groups datasets.
         population = _load_population()
         countries_regions = _load_countries_regions()
+        income_groups = _load_income_groups()
 
         # Invert dictionary of aggregations to have the aggregation as key, and the list of element codes as value.
         aggregations_inverted = {unique_value: pd.unique([item for item, value in aggregations.items()
                                                           if value == unique_value]).tolist()
                                  for unique_value in aggregations.values()}
-
         for region in tqdm(REGIONS_TO_ADD, file=sys.stdout):
-            countries_in_region = _list_countries_in_region(region, countries_regions=countries_regions)
+            countries_in_region = _list_countries_in_region(
+                region, countries_regions=countries_regions, income_groups=income_groups)
             region_code = REGIONS_TO_ADD[region]["area_code"]
             region_population = population[population["country"] == region][["year", "population"]].\
                 reset_index(drop=True)
@@ -598,8 +742,11 @@ def add_regions(data, elements_metadata):
                 # Select relevant rows in the data.
                 data_region = data[(data["country"].isin(countries_in_region)) &
                                    (data["element_code"].isin(element_codes))]
+                
+                # Ensure there is no overlap between historical regions and their successors.
+                data_region = remove_overlapping_data_between_historical_regions_and_successors(data_region)
+
                 if len(data_region) > 0:
-                    # NOTE: using columns in groupby is faster than using `first`
                     data_region = dataframes.groupby_agg(
                         df=data_region.dropna(subset="value"), groupby_columns=[
                             "year", "item_code", "element_code",
@@ -685,6 +832,43 @@ def add_fao_population_if_given(data):
     return data
 
 
+def add_population(df: pd.DataFrame, country_col: str = "country", year_col: str = "year",
+                   population_col: str = "population", warn_on_missing_countries: bool = True,
+                   show_full_warning: bool = True):
+    # This function has been adapted from datautils.geo, because population currently does not include historic
+    # regions. We include them here.
+
+    # Load population dataset.
+    population = _load_population().rename(
+        columns={
+            "country": country_col,
+            "year": year_col,
+            "population": population_col,
+        }
+    )[[country_col, year_col, population_col]]
+
+    # Check if there is any missing country.
+    missing_countries = set(df[country_col]) - set(population[country_col])
+    if len(missing_countries) > 0:
+        if warn_on_missing_countries:
+            geo.warn_on_list_of_entities(
+                list_of_entities=missing_countries,
+                warning_message=(
+                    f"{len(missing_countries)} countries not found in population"
+                    " dataset. They will remain in the dataset, but have nan"
+                    " population."
+                ),
+                show_list=show_full_warning,
+            )
+
+    # Add population to original dataframe.
+    df_with_population = pd.merge(
+        df, population, on=[country_col, year_col], how="left"
+    )
+
+    return df_with_population
+
+
 def convert_variables_given_per_capita_to_total_value(data, elements_metadata):
     # Select element codes that were originally given as per capita variables (if any), and, if FAO population is
     # given, make them total variables instead of per capita.
@@ -722,7 +906,7 @@ def add_per_capita_variables(data, elements_metadata):
     element_codes_to_make_per_capita = elements_metadata[elements_metadata["make_per_capita"]]["element_code"].\
         unique().tolist()
     if len(element_codes_to_make_per_capita) > 0:
-        log.info("clean_data.add_per_capita_variables", shape=data.shape)
+        log.info("add_per_capita_variables", shape=data.shape)
 
         # Create a new dataframe that will have all per capita variables.
         per_capita_data = data[data["element_code"].isin(element_codes_to_make_per_capita)].reset_index(drop=True)
@@ -840,8 +1024,7 @@ def clean_data(data: pd.DataFrame, items_metadata: pd.DataFrame, elements_metada
     # Add column for population; when creating region aggregates, this column will have the population of the countries
     # for which there was data. For example, for Europe in a specific year, the population may differ from item to item,
     # because for one item we may have more European countries informed than for the other.
-    data = geo.add_population_to_dataframe(df=data, population_col="population_with_data",
-                                           warn_on_missing_countries=False)
+    data = add_population(df=data, population_col="population_with_data", warn_on_missing_countries=False)
 
     # Convert back to categorical columns (maybe this should be handled automatically in `add_population_to_dataframe`)
     data = data.astype({"country": "category"})
