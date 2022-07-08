@@ -13,6 +13,7 @@ harmonize = 'etl.harmonize:harmonize'
 backport = 'backport.backport:backport_cli'
 bulk_backport = 'backport.bulk_backport:bulk_backport'
 fasttrack = 'backport.fasttrack:fasttrack'
+compare = 'etl.compare:cli'
 
 [tool.poetry.dependencies]
 python = "^3.9"
@@ -43,6 +44,7 @@ structlog = "^21.5.0"
 sqlmodel = "^0.0.6"
 rich = "^12.1.0"
 owid-datautils = {git = "https://github.com/owid/data-utils-py.git", rev = "v0.4.4-alpha"}
+rich-click = "^1.5.1"
 
 [tool.poetry.dev-dependencies]
 pytest = "^7.1.2"
